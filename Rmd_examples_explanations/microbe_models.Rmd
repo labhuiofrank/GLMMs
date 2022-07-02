@@ -1,0 +1,211 @@
+---
+title: "GLMM model for OTU-Microbiome Data"
+output: html_document
+---
+
+This R Markdown[^1] goes through a generalized liner mixed-effects (GLMMs) model approach with microbiome data to predict OTU abundance based on specific environmental variable. 
+
+**Generalized linear mixed-effects models (GLMMs)** are powerful tools commonly applied to ecological and evolutionary data to dissect variance at multiple scales spanning the environment (e.g. season and geography). GLMM provide a flexible means for appropriately dealing with the complex data structures and relationships between predictors of interest that arise in ecological data, such as over-dispersed count data, complicated experimental design structures, or interactions between key variables (Bolker et al. 2009)[^2]. GLMMs are specified with both **fixed effects** of experimental design or biological interest as well as **random effects** which estimate technical or biological variance from the population. 
+
+Some helpful resources for better understanding GLMM model use from Kyle Edwards OCN 683 class.
+- [GLMMs](https://drive.google.com/drive/folders/1XAqXcMc1tN0aP6UILE_L68-uhpC6F1Xg?usp=sharing)
+
+*<span style="color:red"> Before you work with this code make sure to have analyzed your data through the Microbiome_bootcamp SOP for labhuiofrank.  Results from mantel tests and cross correlations will help identify targeted variables to focus on in these models as they take time and processing power to run and may need to run on the HPCC. </span>*  
+
+[^1]: Updated by Kiana Frank - Oct 2021
+[^2]: Bolker, B.M., Brooks, M.E., Clark, C.J., Geange, S.W., Poulsen, J.R., Stevens, M.H.H. & White, J.-S.S. (2009). Generalized linear mixed models: a practical guide for ecology and evolution. Trends in Ecology & Evolution, 24, 127–135.
+
+## Outiline of Topics
+
+1. Import Packages/Libraries 
+2. Import Data 
+3. Format Data into longform for analysis
+4. gLMM models
+
+--------------------------------------------------------
+
+
+### **<span style="color:blue"> Project Details </span>**
+
+**<span style="color:blue"> Project Title: </span>** 
+  <span style="color:blue"> New Zealand - VM Connect </span>
+
+**<span style="color:blue"> Metagenome used for model analysis: </span>**
+  <span style="color:blue"> metagenome.summer </span>
+
+**<span style="color:blue"> Name/date doing Analysis: </span>** 
+        <span style="color:blue"> Kiana Frank - 10/8/2021 </span>
+
+--------------------------------------------------------
+
+
+## **<span style="color:red">(1) Import Packages/Libraries </span>**
+
+```{r packages, eval=FALSE, include=FALSE}
+#Load the packages (only need to run this once)
+install.packages("tidytext")
+install.packages("topicmodels")
+install.packages("quanteda")
+install.packages("glmmTMB")
+install.packages("ldatuning")
+install.packages("MASS")
+install.packages("car")
+install.packages("lattice")
+```
+
+```{r libraries, message=FALSE}
+library(knitr)
+
+library(tidytext)
+library(topicmodels)
+library(tm)
+library(Matrix)
+library(quanteda)
+library(ggplot2)
+library(dplyr)
+library(plyr)
+library(reshape2)
+library(tidyr)
+library(glmmTMB)
+library(ldatuning)
+library(phyloseq)
+library(MASS)
+library(car)
+library(lattice)
+```
+
+## **<span style="color:red">(2) Import Data into R </span>**
+
+### Format OTU data for input:
+
+Use this Function **<span style="color:green"> taxa_count(metagenome)</span>** to get data into the right format for use in this modeling analyis.  This requires a phyloseq formatted metagenome that has been filtered for prevalance. The advantage of this modeling technique is that we do not need to subsample (or rarefy) data to run = so we are making predictions based on our entire data set and not getting rid of any data. This code merges metadata (column) with OTU counts (column) by sample (row) and create a sumreads column which is the sum of total reads per sample. *I would run this function as part of the Microbiome_bootcamp SOP analysis rather than here*
+
+```{r taxa_count}
+taxa_count <- function(metagenome){
+  data <- metagenome
+  otu <- otu_table(data)
+  otu1 <- as.data.frame(otu)
+  v <- rowSums(otu1)
+  otu1$sumreads <- v
+  otu1 <- otu1 %>% select(sumreads, everything())
+  meta <- sample_data(metagenome)
+  otu_meta <- cbind(meta, otu1[rownames(meta),], "matrix")
+  otu_meta <- otu_meta[, -ncol(otu_meta)]
+  fil <- deparse(substitute(metagenome))
+  filename <- paste(fil, "OTU_count_jmp.csv", sep="_")
+  filepath <- paste(outdir,filename, sep="/")
+  write.csv(otu_meta, file=filepath)
+}
+```
+
+
+### Set file paths
+
+Set file paths and upload the resulting csv from taxa_count here.  *I ran the function within my microbiome_bootcamp analysis, so the file was already in my output folder*
+```{r, results=FALSE}
+indir <- "/Users/klfrank/Dropbox/Bioinformatics/Projects/NewZealand_Analysis/NZL_Analysis_nosub/Inputs"
+outdir <- "/Users/klfrank/Dropbox/Bioinformatics/Projects/NewZealand_Analysis/NZL_Analysis_nosub/Outputs"
+
+count_file <- sprintf("%s/metagenome.summer_OTU_count_jmp.csv", outdir)
+microbiome <- read.table(count_file, row.names=1, sep=",", header=T) 
+
+```
+
+
+## **<span style="color:red">(3) Format Data into longform for analysis </span>**
+
+Organize two datasets -one with OTU by sample matrix, and the other with metadata for each sample. 
+```{r}
+dim(microbiome)
+otuorg<-microbiome[50:7133]
+metadat<-microbiome[1:49]
+```
+
+### Reshape data into long form.  
+This chunk will melt the data and create a long form data frame with a  "Count" column (OTU read count), "OTU" column (name of OTUs), "sumreads" column (sum of total reads per sample), and associated metadata columns as variables of interest.
+```{r}
+meta_colnames <-colnames(metadat)
+longdata<-melt(microbiome, id.vars=meta_colnames,
+               variable.name="OTU",
+               value.name="Count")
+longdata$rowid<-1:nrow(longdata) 
+longdata$values<-as.numeric(longdata$Count)
+filepath <- paste(outdir,"metagenome.summer.longdata.csv", sep="/")
+write.csv(longdata, file=filepath)
+#longdata1<-read.csv(filepath, head=TRUE)
+```
+
+## **<span style="color:red">(4) GLMM Models </span>**
+
+Here, we want to model count data of 16S rRNA sequence reads (i.e. OTU)- where the mean read count of an OTU is affected by some continuous predictor or varies between groups (or both). Most likely our data is quite overdispersed, so we will use a ** negative binomial distribution** (similar to Poisson, but more variance) to model our count data and use random effects to account for the extra variability. The glmmTMB[^3] package increases the range of models that can easily be fitted to count data using maximum likelihood estimation.
+
+We will fit a GLMM where the variable of interest is a random interaction to determine if OTU composition varies with an environmental variable (i.e. pH). Now that we are using random effects to model variability at multiple levels, it becomes important to think about at which level the predictor varies. It is important to think about the hierarchical structure of the data and where the predictors lie in this hierarchy. 
+
+
+[^3]: Brooks, M. E., Kristensen, K., van Benthem, K. J., Magnusson, A., Berg, C. W., Nielsen, A., ... & Bolker, B. M. (2017). Modeling zero-inflated count data with glmmTMB. BioRxiv, 132753.
+
+
+
+### **GLMM with single variable**
+
+```{r eval=FALSE, include=FALSE}
+#to test functionality of code iʻm going to first randomly subsample 50000 rows
+longdata <- longdata[sample(1:nrow(longdata), 500,replace=FALSE),]
+```
+
+Lets just try this with pH, as we found in our microbiome analysis that pH was the most strongly correlated physical variable to microbial community structure (Mantel statsitic R: 0.2736, p=0.001). Moreover, abundances of 189 genus (of 711 total) were statistically correlated with pH (spearman, |cor|>0.25, p<0.05)
+
+
+### MODEL 1 = example with random intercept and slope (*varying-intercepts model*)
+- Predictor is pH
+- Random effect term for OTU
+  - random intercept = (|OTU) 
+  - slope varys by factor (1+pH|)
+- offset(log(sumreads)) controls for differences in sample sizes
+
+```{r echo=TRUE, message=TRUE, warning=TRUE}
+#MOD1 = example with random intercept and slope:
+model1 <- glmmTMB(Count~offset(log(sumreads))+
+                    pH+(1+pH|OTU), 
+                    family = nbinom2, 
+                    data = longdata,
+                    ziformula=~(1|OTU))
+
+summary(model1)
+```
+
+### MODEL 2 = example with random intercept but testing the slope. (*Null Hypothesis/Restricted model*)
+- Predictor is pH
+- Random effect term for OTU
+  - random intercept (|OTU) 
+  - <span style="color:green"> slope not constrained (1|) (*the pH term has been removed which is why its restricted*)</span>
+- offset(log(sumreads)) controls for differences in sample sizes
+
+```{r echo=TRUE, message=TRUE, warning=TRUE}
+#MOD2 =example with random intercept but testing the slope
+model2 = glmmTMB(Count~offset(log(sumreads))+
+                  pH+(1|OTU), 
+                  family = nbinom2, 
+                  data = longdata,
+                  ziformula=~(1|OTU))
+
+summary(model2)
+```
+
+### **Test the model fit with likelihood ratio test**
+
+To find the parameters of a model that provide the best fit to the data, we find the parameter values that maximize the likelihood.The premise of the likelihood ratio test is fairly simple. We fit a model to data based on a hypothesis, and we want to compare it to a model where one of the terms is removed.  In the likelihood framework, we can compare the two hypotheses using the likelihood of two models that represent those hypotheses. The likelihood ratio is always going to be greater than one, i.e. the full model will always have a greater likelihood than the restricted model. Because the full model has an extra free parameter, it will always fit the data a little better, because it has more flexibility in fitting the data.
+
+We test the likelihood of a model using the **<span style="color:green">anova()</span>** function for a one-way anova, i.e. the only term in the model is a single factor. use anova for F-tests on a model with multiple terms
+```{r echo=TRUE, message=TRUE, warning=TRUE}
+anova(model1, model2)
+```
+
+One of the magical things about mixed models is that even though we are truly
+estimating the variance across groups, we can use the fitted model to calculate the ‘best’ estimates for each individual group. We can extract these from the model with **<span style="color:green">ranef()</span>**
+
+```{r eval=FALSE, include=FALSE}
+ranef1 <- ranef(model1)
+filepath <- paste(outdir,"ranef1.csv", sep="/")
+write.csv(ranef1, filepath)
+```
